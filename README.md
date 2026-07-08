@@ -1,244 +1,166 @@
 # Entra ID Attack Path Visualizer
 
-**Automated detection and visualization of privilege escalation paths in Microsoft Entra ID (Azure AD)**
+Scans a Microsoft Entra ID tenant via Microsoft Graph API, detects privilege escalation paths through direct role assignments, group memberships, and PIM eligible roles, then generates an interactive HTML graph showing every path to administrative access.
 
-![Privilege Escalation Graph](examples/sample_output.png)
+![Privilege Escalation Map](docs/privilege_graph_screenshot.png)
 
----
+## The Problem
 
-## Overview
+Organizations lose track of who has administrative privileges in Entra ID:
 
-The Entra ID Attack Path Visualizer scans your Microsoft Entra ID environment to detect privilege escalation paths through group memberships, role assignments, and nested permissions. It identifies users who have administrative access—both directly assigned and inherited through group chains.
+- **Shadow admins**: users inherit admin access through nested group memberships without anyone realizing it
+- **PIM blind spots**: users with eligible (not yet activated) roles don't show up in standard directory role queries, but they can activate to admin at any time
+- **Role sprawl**: multiple users and groups assigned to privileged roles unnecessarily
+- **Manual reviews miss indirect paths**: a user in a group that's assigned Global Administrator is a Global Administrator, but that doesn't show up when you look at the user's direct role assignments
 
-### The Problem
+Manual review of hundreds of users and groups takes 40+ hours per quarter. This tool automates it in under 5 minutes.
 
-Organizations often lose track of who has administrative privileges in Entra ID:
-- **Shadow Admins**: Users gain admin access through nested group memberships
-- **Role Sprawl**: Multiple entities assigned to privileged roles unnecessarily  
-- **Audit Failures**: Manual reviews miss indirect privilege paths
-- **Compliance Risks**: SOC 2, ISO 27001, and other frameworks require regular access reviews
+## What It Detects
 
-**Manual review of hundreds of users and groups = 40+ hours of work**
+- **Direct role assignments**: User &rarr; Admin Role
+- **Group-based escalation paths**: User &rarr; Group &rarr; Admin Role
+- **PIM eligible assignments**: users who can activate to admin roles on demand (queried via REST against the `roleEligibilitySchedules` endpoint since the Graph SDK doesn't handle this well)
+- **Risk classification**: HIGH risk (Global Admin, Privileged Role Admin, Application Admin, Cloud App Admin, Authentication Admin) vs MEDIUM risk (User Admin, Helpdesk Admin, Exchange Admin, etc.)
 
-**This tool automates it in 5 minutes.**
+### Privileged Roles Scanned
 
----
+Global Administrator, Privileged Role Administrator, User Administrator, Security Administrator, Exchange Administrator, SharePoint Administrator, Intune Administrator, Application Administrator, Cloud Application Administrator, Authentication Administrator, Helpdesk Administrator, Password Administrator, Conditional Access Administrator, Groups Administrator
 
-## What It Does
+## Output
 
-✅ **Scans Entra ID environment** via Microsoft Graph API  
-✅ **Detects admin role assignments** (Global Admin, User Admin, Security Admin, etc.)  
-✅ **Identifies privilege escalation paths** through group membership chains  
-✅ **Generates visual graph** showing all privilege relationships  
-✅ **Exports findings** to JSON for compliance documentation  
+```
+output/
+├── scan_results.json       # Complete findings (users, groups, roles, paths, PIM eligible)
+└── privilege_graph.html    # Interactive graph (open in browser)
+```
 
----
+The interactive graph is built with [pyvis](https://pyvis.readthedocs.io/) (vis.js under the hood). Nodes are draggable, hovering shows UPN and risk details, and the layout uses hierarchical top-down positioning with roles at the top, groups in the middle, and users at the bottom.
+
+### Visual Encoding
+
+| Element | Meaning |
+|---|---|
+| Red solid line | Active HIGH risk path |
+| Orange solid line | Active MEDIUM risk path |
+| Purple dashed line | PIM eligible HIGH risk path |
+| Purple (muted) dashed line | PIM eligible MEDIUM risk path |
+| Red diamond | Admin role (HIGH risk) |
+| Orange diamond | Admin role (MEDIUM risk) |
+| Orange square | Group |
+| Blue circle | User |
 
 ## Installation
 
 ### Prerequisites
+
 - Python 3.10+
-- Microsoft Entra ID tenant with admin access
-- Microsoft Graph API permissions
+- Microsoft Entra ID tenant with admin read access
+- Entra ID P2 license (for PIM eligible role scanning)
 
 ### Setup
+
 ```bash
-# Clone repository
 git clone https://github.com/Dfrank77/entra-attack-path-visualizer.git
 cd entra-attack-path-visualizer
 
-# Create virtual environment
 python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+source venv/bin/activate  # Windows: venv\Scripts\activate
 
-# Install dependencies
 pip install -r requirements.txt
 ```
 
----
+### Microsoft Graph Permissions Required
+
+| Permission | Why |
+|---|---|
+| `User.Read.All` | Read all user profiles |
+| `Group.Read.All` | Read all group memberships |
+| `Directory.Read.All` | Read directory data |
+| `RoleManagement.Read.All` | Read role assignments |
+| `RoleManagement.Read.Directory` | Read directory role definitions |
+| `RoleEligibilitySchedule.Read.Directory` | Read PIM eligible role assignments |
 
 ## Usage
 
-### Quick Start
 ```bash
-# Activate virtual environment
 source venv/bin/activate
 
-# Run scanner
-python src/entra_scanner.py
+# Run the scanner (opens browser for OAuth2 login)
+python entra_scanner.py
 
-# Generate visualization
-python src/visualizer.py
+# Generate the interactive visualization
+python visualizer.py
+
+# Open the graph
+open output/privilege_graph.html    # macOS
+# or just open in any browser
 ```
 
 ### What Happens
 
-1. **Authentication**: Browser opens for Microsoft login (OAuth2)
-2. **Scanning**: Tool reads users, groups, and role assignments via Microsoft Graph API
-3. **Analysis**: Identifies admin access and privilege escalation paths
-4. **Visualization**: Generates graph showing relationships
-5. **Export**: Saves findings to `output/scan_results.json`
+1. **Authentication**: browser opens for Microsoft OAuth2 login. The scanner authenticates twice: once for the Graph SDK and once for a raw REST token used by the PIM queries.
+2. **User scan**: enumerates all users via Graph SDK with pagination
+3. **Group scan**: enumerates all groups via Graph SDK with pagination
+4. **Directory role scan**: reads all active directory role assignments and their members (including groups as members)
+5. **PIM eligible role scan**: queries `roleEligibilitySchedules` via REST (aiohttp) since the Graph SDK doesn't handle this endpoint reliably. Maps role definition IDs to display names.
+6. **Privilege path analysis**: walks each role assignment and PIM eligible assignment, resolves group memberships to individual users, classifies risk level, and builds the path graph
+7. **Export**: writes `scan_results.json` and generates `privilege_graph.html`
 
-### Output Files
+## Architecture
+
 ```
-output/
-├── scan_results.json       # Complete findings in JSON format
-└── privilege_graph.png     # Visual graph (high-resolution)
+entra_scanner.py          # Scanner + analyzer (async, Graph SDK + aiohttp REST)
+visualizer.py             # Interactive HTML graph generator (pyvis)
+src/
+├── entra_scanner.py      # Mirror of root scanner
+├── visualizer.py         # Mirror of root visualizer
+└── main.py               # Entry point wrapper
+lib/                      # pyvis/vis.js dependencies for standalone HTML
+output/                   # Scan results and visualization (gitignored)
+requirements.txt          # Pinned dependencies
 ```
 
----
+### Why aiohttp for PIM
 
-## Technical Details
+The Microsoft Graph Python SDK (`msgraph`) handles most API calls, but the PIM eligible role endpoints (`roleEligibilitySchedules`) don't work reliably through the SDK. Rather than fighting SDK bugs, the scanner makes direct REST calls using `aiohttp` with a raw bearer token. The async pattern is required because the Graph SDK is async-only; mixing sync `requests` calls into an async pipeline would block the event loop.
 
-### Architecture
+## Tech Stack
 
-- **Scanner (`entra_scanner.py`)**: Connects to Microsoft Graph API, retrieves users/groups/roles
-- **Analyzer**: Identifies admin role assignments and privilege paths
-- **Visualizer (`visualizer.py`)**: Builds network graph using NetworkX, renders with Matplotlib
+| Component | Purpose |
+|---|---|
+| [Microsoft Graph SDK](https://github.com/microsoftgraph/msgraph-sdk-python) | Entra ID API access (users, groups, directory roles) |
+| [aiohttp](https://docs.aiohttp.org/) | Async REST calls for PIM eligible role queries |
+| [Azure Identity](https://learn.microsoft.com/en-us/python/api/azure-identity/) | OAuth2 interactive browser authentication |
+| [pyvis](https://pyvis.readthedocs.io/) | Interactive network graph visualization (vis.js wrapper) |
+| [colorama](https://github.com/tartley/colorama) | Color-coded terminal output during scans |
 
-### Microsoft Graph API Permissions Required
+## Roadmap
 
-- `User.Read.All` - Read all user profiles
-- `Group.Read.All` - Read all group memberships
-- `Directory.Read.All` - Read directory data
-- `RoleManagement.Read.All` - Read role assignments
-
-### Technology Stack
-
-- **Microsoft Graph SDK** - Entra ID API access
-- **NetworkX** - Graph analysis and privilege path detection
-- **Matplotlib** - Visualization rendering
-- **Azure Identity** - OAuth2 authentication
-
----
-
-## Visual Guide
-
-**The graph uses color-coded shapes:**
-
-- 🔵 **Blue Circles** = Users
-- 🟧 **Orange Squares** = Groups
-- 🔴 **Red Diamonds** = Admin Roles (High Risk)
-- ➡️ **Arrows** = Privilege escalation paths
-
-**Reading the Graph:**
-- Entities at the **TOP** = Highest privilege (Admin roles)
-- Entities at the **BOTTOM** = Regular users
-- **Follow arrows upward** to trace privilege escalation paths
-
----
-
-## Business Value
-
-### Time Savings
-- **Manual access review**: 40+ hours per quarter
-- **Automated scan**: 5 minutes
-- **ROI**: 99% time reduction
-
-### Compliance
-- **SOC 2**: Automated quarterly access reviews
-- **PCI-DSS**: Least privilege verification
-- **ISO 27001**: Administrative access audit trail
-
-### Security
-- Identifies shadow administrators
-- Detects privilege creep
-- Prevents unauthorized access
-- Provides audit evidence
-
----
-
-## What This Project Demonstrates
-
-**Identity & Access Management Expertise:**
-- Deep understanding of Entra ID architecture
-- Knowledge of privilege escalation attack vectors
-- Experience with Microsoft Graph API
-- Access review and compliance processes
-
-**Security Engineering Skills:**
-- Automated security analysis
-- Risk assessment and prioritization
-- Compliance documentation
-- Security tool development
-
-**Technical Capabilities:**
-- Python development
-- API integration (Microsoft Graph)
-- Graph analysis and visualization
-- Async programming patterns
-
----
-
-## Use Cases
-
-### SOC 2 Compliance
-- Quarterly access reviews required
-- Automated detection of excessive privileges
-- Audit trail documentation
-
-### Security Audits
-- Identify shadow administrators
-- Verify least privilege implementation
-- Generate compliance reports
-
-### Incident Response
-- Quickly identify all users with admin access
-- Trace privilege escalation paths
-- Document access for forensics
-
----
-
-## Future Enhancements
-
+- [x] Direct role assignment scanning
+- [x] Group membership privilege path detection
+- [x] PIM eligible role assignment scanning
+- [x] Expanded privileged role coverage (14 roles)
+- [x] Interactive HTML visualization with pyvis
+- [x] Risk classification (HIGH / MEDIUM)
+- [ ] Service principal and app registration scanning
 - [ ] Nested group membership analysis (multi-level)
-- [ ] PIM (Privileged Identity Management) integration
 - [ ] Conditional Access policy analysis
 - [ ] Historical trend tracking
 - [ ] Multi-tenant support
 - [ ] Scheduled scans with alerting
-- [ ] Export to CSV/Excel for reporting
-
----
 
 ## Author
 
-**Darius Frank**  
-IAM & Cloud Security Analyst
+**Darius Frank** -- IAM & Cloud Security
 
-- **GitHub**: [@Dfrank77](https://github.com/Dfrank77)
-- **LinkedIn**: [Darius Frank](https://linkedin.com/in/darius-frank-24a895192)
-- **Portfolio**: [security-learning-artifacts](https://github.com/Dfrank77/security-learning-artifacts)
-
-**Background:**
-- 2 years hands-on IAM experience (Entra ID, AWS, Okta)
-- Security+, Microsoft SC-300 certified
-- Built parallel tool for AWS: [IAM Attack Path Visualizer](https://github.com/Dfrank77/iam-attack-path-visualizer)
-
-*Demonstrating cross-platform IAM security expertise through automated privilege escalation detection.*
-
----
+- GitHub: [@Dfrank77](https://github.com/Dfrank77)
+- LinkedIn: [Darius Frank](https://www.linkedin.com/in/darius-frank/)
+- Portfolio: [dfrank-iam.com](https://dfrank-iam.com)
 
 ## License
 
-MIT License - See [LICENSE](LICENSE) file for details
+MIT License -- see [LICENSE](LICENSE) for details.
 
-**Copyright © 2026 Darius Frank**
+## Disclaimer
 
----
-
-## Acknowledgments
-
-Built with:
-- Microsoft Graph SDK
-- NetworkX (graph analysis)
-- Matplotlib (visualization)
-- Azure Identity (authentication)
-
-Inspired by real-world IAM security challenges and the need for automated privilege escalation detection across cloud platforms.
-
----
-
-**⚠️ Disclaimer**
-
-This tool is intended for authorized security assessments and compliance audits only. Users must have appropriate permissions to scan their Entra ID environment. Unauthorized access to systems is illegal.
+This tool is for authorized security assessments and compliance audits only. You must have appropriate permissions to scan your Entra ID environment. Unauthorized access to systems is illegal.
