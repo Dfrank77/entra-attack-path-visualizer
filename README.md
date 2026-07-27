@@ -4,7 +4,7 @@ Scans a Microsoft Entra ID tenant via Microsoft Graph, detects privilege escalat
 
 Part of a three-tool portfolio built on the shared [`entra-security-report`](https://github.com/Dfrank77/entra-security-report) library, alongside [`entra-workload-identity-scanner`](https://github.com/Dfrank77/entra-workload-identity-scanner) and [`entra-zt-policy-engine`](https://github.com/Dfrank77/entra-zt-policy-engine).
 
-![Privilege Escalation Map](docs/Entra ID Privilege Escalation Map.jpeg)
+![Privilege Escalation Map](docs/Entra_ID_Privilege_Escalation_Map.jpeg)
 
 ## The Problem
 
