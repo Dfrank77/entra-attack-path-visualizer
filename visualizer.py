@@ -1,259 +1,298 @@
-from pyvis.network import Network
-import json
+"""Read findings from shared storage and produce two artifacts:
+1. Structured HTML report (via shared library)
+2. Interactive pyvis graph (privilege escalation map)
+"""
+
 import os
+from collections import defaultdict
 from datetime import datetime
+from pyvis.network import Network
+
+from entra_security_report import Storage, render
 
 
 class EntraPrivilegeVisualizer:
-    def __init__(self, scan_file='output/scan_results.json'):
-        with open(scan_file, 'r') as f:
-            self.results = json.load(f)
+    def __init__(self):
+        self.storage = Storage(".findings")
+        latest_scan = self.storage.latest_scan(tool="attack-path")
+        if not latest_scan:
+            raise SystemExit("No attack-path scans found. Run entra_scanner.py first.")
 
-    def generate_visualization(self, output_file='output/privilege_graph.html'):
-        """Generate interactive HTML privilege escalation graph"""
-        print("Building interactive privilege graph...")
+        self.findings = [
+            self.storage.load_finding(fid)
+            for fid in latest_scan.finding_ids
+        ]
+        self.findings = [f for f in self.findings if f is not None]
+        self.scan = latest_scan
 
-        os.makedirs(os.path.dirname(output_file) if os.path.dirname(output_file) else '.', exist_ok=True)
+    def generate_html_report(self, output_file="output/privilege_report.html"):
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
 
-        net = Network(
-            height='900px', width='100%',
-            bgcolor='#0d1117', font_color='#e6edf3',
-            directed=True, select_menu=False, filter_menu=False
+        active_count = sum(1 for f in self.findings if f.evidence.get("assignment_type") == "active")
+        eligible_count = sum(1 for f in self.findings if f.evidence.get("assignment_type") == "eligible")
+
+        html = render(
+            self.findings,
+            title="Entra ID Privilege Escalation Map",
+            subtitle=f"Tenant {self.scan.tenant_id}",
+            tenant_id=self.scan.tenant_id,
+            group_by="subject",
+            metadata={
+                "users at risk": len({f.subject.id for f in self.findings}),
+                "active paths": active_count,
+                "pim eligible": eligible_count,
+            },
         )
 
+        with open(output_file, "w") as f:
+            f.write(html)
+        print(f"HTML report saved to {output_file}")
+
+    def generate_graph(self, output_file="output/privilege_graph.html"):
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+
+        net = Network(
+            height="900px", width="100%",
+            bgcolor="#f8fafc", font_color="#0f172a",
+            directed=True,
+        )
         net.set_options("""
         {
           "physics": {
             "enabled": true,
-            "hierarchicalRepulsion": {
-              "centralGravity": 0.0,
+            "barnesHut": {
+              "gravitationalConstant": -20000,
+              "centralGravity": 0.15,
               "springLength": 200,
-              "springConstant": 0.01,
-              "nodeDistance": 180,
-              "damping": 0.09
+              "springConstant": 0.03,
+              "damping": 0.5,
+              "avoidOverlap": 0.8
             },
-            "solver": "hierarchicalRepulsion",
-            "stabilization": { "enabled": true, "iterations": 500 }
+            "solver": "barnesHut",
+            "stabilization": { "enabled": true, "iterations": 1500, "fit": true }
           },
-          "layout": {
-            "hierarchical": {
-              "enabled": true,
-              "direction": "UD",
-              "sortMethod": "directed",
-              "levelSeparation": 250,
-              "nodeSpacing": 200,
-              "treeSpacing": 300
-            }
+          "nodes": {
+            "font": { "size": 14, "face": "-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif", "color": "#0f172a" },
+            "borderWidth": 2,
+            "borderWidthSelected": 5,
+            "scaling": { "min": 15, "max": 80 }
           },
           "edges": {
-            "smooth": {
-              "type": "cubicBezier",
-              "forceDirection": "vertical",
-              "roundness": 0.4
-            }
+            "smooth": { "type": "continuous" },
+            "width": 2,
+            "selectionWidth": 4,
+            "hoverWidth": 3
           },
           "interaction": {
             "hover": true,
-            "tooltipDelay": 100,
-            "navigationButtons": true
+            "hoverConnectedEdges": true,
+            "navigationButtons": true,
+            "hideEdgesOnDrag": true
           }
         }
         """)
 
-        paths = self.results.get('privilege_paths', [])
-        pim_eligible = self.results.get('pim_eligible_assignments', [])
-        summary = self.results.get('summary', {})
-        users_list = self.results.get('users', [])
+        group_role_edges = defaultdict(list)
+        direct_edges = []
+        pim_edges = []
 
-        # Build UPN lookup
-        upn_map = {u['name']: u.get('upn', '') for u in users_list}
+        for f in self.findings:
+            path = f.evidence.get("path", [])
+            path_type = f.evidence.get("path_type", "")
+            if len(path) == 3:
+                key = (path[1], path[2])
+                if path_type.startswith("pim"):
+                    pim_edges.append((f.subject.display_name, path[1], path[2]))
+                else:
+                    group_role_edges[key].append(f.subject.display_name)
+            elif len(path) == 2:
+                if path_type.startswith("pim"):
+                    pim_edges.append((f.subject.display_name, None, path[1]))
+                else:
+                    direct_edges.append((f.subject.display_name, path[1]))
 
-        added_nodes = set()
-        edges_to_add = []
+        role_reach = defaultdict(int)
+        for (group, role), users in group_role_edges.items():
+            role_reach[role] += len(users)
+        for user, role in direct_edges:
+            role_reach[role] += 1
+        for user, group, role in pim_edges:
+            role_reach[role] += 1
 
-        for path_entry in paths:
-            path = path_entry['path']
-            risk = path_entry.get('risk', 'MEDIUM')
-            assignment_type = path_entry.get('assignment_type', 'active')
-            path_type = path_entry.get('path_type', 'direct_assignment')
+        added = set()
 
-            if len(path) == 2:
-                user_name, role_name = path[0], path[1]
-                self._add_user_node(net, user_name, upn_map, added_nodes)
-                self._add_role_node(net, role_name, risk, added_nodes)
-                edges_to_add.append((user_name, role_name, risk, assignment_type, path_type))
+        def add_role(name):
+            if name in added:
+                return
+            added.add(name)
+            reach = role_reach.get(name, 1)
+            size = 25 + min(reach * 2, 40)
+            net.add_node(name, label=name,
+                         color={"background": "#ff0000", "border": "#b91c1c"},
+                         font={"color": "#ffffff", "size": 16, "face": "-apple-system"},
+                         shape="box",
+                         size=size, title=f"Admin role: {name} ({reach} paths)")
+            
 
-            elif len(path) == 3:
-                user_name, group_name, role_name = path[0], path[1], path[2]
-                self._add_user_node(net, user_name, upn_map, added_nodes)
-                self._add_group_node(net, group_name, added_nodes)
-                self._add_role_node(net, role_name, risk, added_nodes)
-                edges_to_add.append((user_name, group_name, risk, assignment_type, 'group_member'))
-                edges_to_add.append((group_name, role_name, risk, assignment_type, path_type))
+        def add_group(name):
+            if name in added:
+                return
+            added.add(name)
+            net.add_node(name, label=name, color={"background": "#ffd400", "border": "#a16207"},
+                         font={"color": "#0f172a", "size": 16, "face": "-apple-system", "strokeWidth": 3, "strokeColor": "#f8fafc"},
+                         shape="ellipse", size=25, title=f"Group: {name}")
 
-        # Deduplicate and add edges
-        seen_edges = set()
-        for src, dst, risk, assignment_type, ptype in edges_to_add:
-            edge_key = f"{src}|{dst}|{assignment_type}"
-            if edge_key in seen_edges:
-                continue
-            seen_edges.add(edge_key)
+        def add_user(name):
+            if name in added:
+                return
+            added.add(name)
+            net.add_node(name, label=name, color={"background": "#2563eb", "border": "#1e40af"},
+                         font={"color": "#ffffff"}, shape="dot",
+                         size=15, title=f"User: {name}")
 
-            if assignment_type == 'eligible':
-                color = '#bc8cff' if risk == 'HIGH' else '#9d7aed'
-                dashes = True
-                width = 3
+        # Collapsed group -> role edges
+        for (group, role), users in group_role_edges.items():
+            add_role(role)
+            add_group(group)
+            cluster_id = f"__cluster_{group}_{role}"
+            if cluster_id not in added:
+                added.add(cluster_id)
+                title = f"{len(users)} users reach {role} via {group}:\n" + "\n".join(sorted(users)[:15])
+                if len(users) > 15:
+                    title += f"\n... and {len(users) - 15} more"
+                net.add_node(cluster_id, label=f"{len(users)} users",
+                             color={"background": "#2563eb", "border": "#1e40af"},
+                             font={"color": "#ffffff"}, shape="dot", size=20, title=title)
+            net.add_edge(cluster_id, group, color="#2563eb", width=2)
+            net.add_edge(group, role, color="#ff0000", width=3, label=role)
+
+        # Direct assignments
+        for user, role in direct_edges:
+            add_role(role)
+            add_user(user)
+            net.add_edge(user, role, color="#ff0000", width=2)
+
+        # PIM eligible (dashed)
+        for user, group, role in pim_edges:
+            add_role(role)
+            add_user(user)
+            if group:
+                add_group(group)
+                net.add_edge(user, group, color="#ff7a00", width=2, dashes=True)
+                net.add_edge(group, role, color="#ff7a00", width=2, dashes=True)
             else:
-                color = '#f85149' if risk == 'HIGH' else '#d29922'
-                dashes = False
-                width = 3 if risk == 'HIGH' else 2
+                net.add_edge(user, role, color="#ff7a00", width=2, dashes=True,
+                             title="PIM eligible (dormant privilege)")
 
-            net.add_edge(
-                src, dst,
-                color=color, width=width, dashes=dashes,
-                arrows={'to': {'enabled': True, 'scaleFactor': 1.2}},
-                title=f"{src} &rarr; {dst}<br>Type: {assignment_type}<br>Risk: {risk}"
-            )
+        hover_js = """
+        <script type="text/javascript">
+          window.addEventListener('load', function() {
+            var checkNetwork = setInterval(function() {
+              if (typeof network !== 'undefined' && typeof nodes !== 'undefined') {
+                clearInterval(checkNetwork);
+                var originalSizes = {};
+                nodes.forEach(function(n) { originalSizes[n.id] = n.size || 25; });
+                network.on('hoverNode', function(params) {
+                  nodes.update({ id: params.node, size: originalSizes[params.node] * 5, borderWidth: 6 });
+                });
+                network.on('blurNode', function(params) {
+                  nodes.update({ id: params.node, size: originalSizes[params.node], borderWidth: 2 });
+                });
+              }
+            }, 100);
+          });
+        </script>
+        """
 
-        # Generate HTML
         net.save_graph(output_file)
 
-        # Inject summary overlay and title
-        self._inject_overlay(output_file, summary, paths, pim_eligible)
+        with open(output_file, "r") as f:
+            html = f.read()
 
-        print(f"Visualization saved to {output_file}")
-        print("Open in a browser to interact with the graph.")
+        total = len(self.findings)
+        by_sev = defaultdict(int)
+        for f in self.findings:
+            by_sev[f.severity] += 1
 
-    def _add_user_node(self, net, name, upn_map, added):
-        if name in added:
-            return
-        upn = upn_map.get(name, '')
-        net.add_node(
-            name, label=name, shape='dot', size=30,
-            color={'background': '#0d419d', 'border': '#58a6ff',
-                   'highlight': {'background': '#1a5cc8', 'border': '#79c0ff'}},
-            borderWidth=3,
-            font={'size': 14, 'color': '#e6edf3', 'face': 'monospace'},
-            level=2,
-            title=f"<b>{name}</b><br>UPN: {upn}<br>Type: User"
-        )
-        added.add(name)
-
-    def _add_group_node(self, net, name, added):
-        if name in added:
-            return
-        net.add_node(
-            name, label=name, shape='square', size=30,
-            color={'background': '#6e3a00', 'border': '#d29922',
-                   'highlight': {'background': '#8a4a00', 'border': '#e3b341'}},
-            borderWidth=3,
-            font={'size': 14, 'color': '#e6edf3', 'face': 'monospace'},
-            level=1,
-            title=f"<b>{name}</b><br>Type: Group"
-        )
-        added.add(name)
-
-    def _add_role_node(self, net, name, risk, added):
-        if name in added:
-            return
-        bg = '#b62324' if risk == 'HIGH' else '#7a3000'
-        border = '#f85149' if risk == 'HIGH' else '#d29922'
-        net.add_node(
-            name, label=name, shape='diamond', size=35,
-            color={'background': bg, 'border': border,
-                   'highlight': {'background': '#d13438', 'border': '#ff7b72'}},
-            borderWidth=3,
-            font={'size': 14, 'color': '#e6edf3', 'face': 'monospace'},
-            level=0,
-            title=f"<b>{name}</b><br>Type: Admin Role<br>Risk: {risk}"
-        )
-        added.add(name)
-
-    def _inject_overlay(self, output_file, summary, paths, pim_eligible):
-        """Inject the summary panel and title bar into the HTML"""
-
-        high_html = ''
-        for p in [p for p in paths if p.get('risk') == 'HIGH']:
-            atype = p.get('assignment_type', 'active')
-            tag = '<span style="color:#bc8cff">[PIM]</span>' if atype == 'eligible' else '<span style="color:#f85149">[ACT]</span>'
-            path_str = ' &rarr; '.join(p['path'])
-            high_html += f'<div style="margin:3px 0;font-size:12px">{tag} {path_str}</div>'
-
-        pim_html = ''
-        for p in pim_eligible:
-            name = p.get("member_name", "?")
-            role = p.get("role", "?")
-            pim_html += f'<div style="margin:3px 0;font-size:12px"><span style="color:#e6edf3">{name}</span> <span style="color:#bc8cff">&rarr; {role}</span></div>'
-
-        scan_time = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-        overlay = f"""
-        <div style="position:fixed;top:0;left:0;right:0;height:50px;background:#0d1117;
-             border-bottom:1px solid #30363d;display:flex;align-items:center;
-             justify-content:center;z-index:9998;font-family:monospace">
-          <span style="font-size:20px;font-weight:bold;color:#e6edf3">ENTRA ID PRIVILEGE ESCALATION MAP</span>
-          <span style="font-size:12px;color:#8b949e;margin-left:20px">Scan: {scan_time}</span>
-        </div>
-
-        <div style="position:fixed;top:60px;right:15px;background:#161b22;border:1px solid #30363d;
-             border-radius:8px;padding:18px 22px;font-family:monospace;color:#e6edf3;width:320px;
-             max-height:calc(100vh - 80px);overflow-y:auto;z-index:9999;
-             box-shadow:0 4px 20px rgba(0,0,0,0.5)">
-
-          <div style="font-size:16px;font-weight:bold;text-align:center;margin-bottom:10px">RISK SUMMARY</div>
-          <hr style="border-color:#30363d;margin:8px 0">
-
-          <div style="display:flex;justify-content:space-between;margin:4px 0"><span style="color:#8b949e">Total Users</span><b>{summary.get('total_users',0)}</b></div>
-          <div style="display:flex;justify-content:space-between;margin:4px 0"><span style="color:#8b949e">Total Groups</span><b>{summary.get('total_groups',0)}</b></div>
-          <div style="display:flex;justify-content:space-between;margin:4px 0"><span style="color:#8b949e">Active Assignments</span><b>{summary.get('total_active_assignments',0)}</b></div>
-          <div style="display:flex;justify-content:space-between;margin:4px 0"><span style="color:#8b949e">PIM Eligible</span><b style="color:#bc8cff">{summary.get('total_pim_eligible',0)}</b></div>
-
-          <hr style="border-color:#30363d;margin:10px 0">
-          <div style="font-size:14px;font-weight:bold;text-align:center;margin-bottom:6px">PRIVILEGE PATHS</div>
-
-          <div style="display:flex;justify-content:space-between;margin:4px 0"><span style="color:#8b949e">Total Paths</span><b>{summary.get('privilege_paths_found',0)}</b></div>
-          <div style="display:flex;justify-content:space-between;margin:4px 0"><span style="color:#8b949e">HIGH Risk</span><b style="color:#f85149">{summary.get('high_risk_paths',0)}</b></div>
-          <div style="display:flex;justify-content:space-between;margin:4px 0"><span style="color:#8b949e">MEDIUM Risk</span><b style="color:#d29922">{summary.get('medium_risk_paths',0)}</b></div>
-          <div style="display:flex;justify-content:space-between;margin:4px 0"><span style="color:#8b949e">Active</span><b style="color:#f85149">{summary.get('active_paths',0)}</b></div>
-          <div style="display:flex;justify-content:space-between;margin:4px 0"><span style="color:#8b949e">PIM Eligible</span><b style="color:#bc8cff">{summary.get('eligible_paths',0)}</b></div>
-
-          <hr style="border-color:#30363d;margin:10px 0">
-          <div style="font-size:13px;font-weight:bold;text-align:center;color:#f85149;margin-bottom:6px">HIGH RISK PATHS</div>
-          {high_html}
-
-          <hr style="border-color:#30363d;margin:10px 0">
-          <div style="font-size:13px;font-weight:bold;text-align:center;color:#bc8cff;margin-bottom:6px">PIM ELIGIBLE ROLES</div>
-          {pim_html}
-        </div>
-
-        <div style="position:fixed;bottom:15px;left:15px;background:#161b22;border:1px solid #30363d;
-             border-radius:8px;padding:14px 18px;font-family:monospace;color:#e6edf3;
-             z-index:9999;box-shadow:0 4px 20px rgba(0,0,0,0.5)">
-          <div style="font-size:12px;font-weight:bold;color:#8b949e;margin-bottom:8px;text-align:center">LEGEND</div>
-          <div style="margin:3px 0;font-size:11px"><span style="color:#f85149">&#9473;&#9473;&#9473;</span> Active HIGH risk</div>
-          <div style="margin:3px 0;font-size:11px"><span style="color:#d29922">&#9473;&#9473;&#9473;</span> Active MEDIUM risk</div>
-          <div style="margin:3px 0;font-size:11px"><span style="color:#bc8cff">- - - -</span> PIM eligible (HIGH)</div>
-          <div style="margin:3px 0;font-size:11px"><span style="color:#9d7aed">- - - -</span> PIM eligible (MEDIUM)</div>
-          <div style="margin:8px 0 2px 0;border-top:1px solid #30363d;padding-top:6px">
-            <div style="margin:3px 0;font-size:11px"><span style="display:inline-block;width:12px;height:12px;background:#b62324;border:2px solid #f85149;border-radius:2px;vertical-align:middle"></span> Admin Role</div>
-            <div style="margin:3px 0;font-size:11px"><span style="display:inline-block;width:12px;height:12px;background:#6e3a00;border:2px solid #d29922;vertical-align:middle"></span> Group</div>
-            <div style="margin:3px 0;font-size:11px"><span style="display:inline-block;width:12px;height:12px;background:#0d419d;border:2px solid #58a6ff;border-radius:50%;vertical-align:middle"></span> User</div>
+        banner = f"""
+        <div style="background: #ffffff; color: #0f172a; padding: 1.25rem 1.5rem; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; border-bottom: 1px solid #e5e7eb;">
+          <div style="max-width: 1400px; margin: 0 auto;">
+            <div style="font-size: 1.5rem; font-weight: 700; margin: 0 0 0.25rem;">Entra ID Privilege Escalation Map</div>
+            <div style="color: #64748b; font-size: 0.95rem; margin: 0 0 0.75rem;">Tenant {self.scan.tenant_id} · {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}</div>
+            <div style="display: flex; gap: 2rem; padding-top: 0.75rem; border-top: 1px solid #e5e7eb;">
+              <div><span style="font-size: 1.5rem; font-weight: 700;">{total}</span> <span style="color: #64748b; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em;">findings</span></div>
+              <div><span style="font-size: 1.5rem; font-weight: 700; color: #ff0000;">{by_sev.get('critical', 0)}</span> <span style="color: #64748b; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em;">critical</span></div>
+              <div><span style="font-size: 1.5rem; font-weight: 700; color: #ff7a00;">{by_sev.get('high', 0)}</span> <span style="color: #64748b; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em;">high</span></div>
+              <div><span style="font-size: 1.5rem; font-weight: 700; color: #ffd400;">{by_sev.get('medium', 0)}</span> <span style="color: #64748b; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em;">medium</span></div>
+            </div>
           </div>
         </div>
         """
+        legend = """
+        <div style="position: fixed; bottom: 1.5rem; right: 1.5rem; background: #ffffff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 1rem 1.25rem; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.85rem; color: #0f172a; box-shadow: 0 4px 12px rgba(0,0,0,0.08); z-index: 10; min-width: 260px; max-height: 85vh; overflow-y: auto;">
+          <div style="font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; font-size: 0.7rem; color: #64748b; margin-bottom: 0.75rem;">Nodes</div>
+          <div style="display: flex; flex-direction: column; gap: 0.5rem;">
+            <div style="display: flex; align-items: center; gap: 0.625rem;">
+              <span style="display: inline-block; width: 22px; height: 12px; background: #ff0000; border: 2px solid #b91c1c; border-radius: 2px;"></span>
+              <span>Admin role <span style="color: #64748b;">(size = reach)</span></span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 0.625rem;">
+              <span style="display: inline-block; width: 18px; height: 12px; background: #ffd400; border: 2px solid #a16207; border-radius: 50%;"></span>
+              <span>Group</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 0.625rem;">
+              <span style="display: inline-block; width: 12px; height: 12px; background: #2563eb; border: 2px solid #1e40af; border-radius: 50%;"></span>
+              <span>User</span>
+            </div>
+          </div>
 
-        with open(output_file, 'r') as f:
-            html = f.read()
+          <div style="font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; font-size: 0.7rem; color: #64748b; margin: 1rem 0 0.75rem;">Edges</div>
+          <div style="display: flex; flex-direction: column; gap: 0.5rem;">
+            <div style="display: flex; align-items: center; gap: 0.625rem;">
+              <span style="display: inline-block; width: 24px; height: 3px; background: #ff0000;"></span>
+              <span>Active assignment</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 0.625rem;">
+              <span style="display: inline-block; width: 24px; height: 0; border-top: 3px dashed #ff7a00;"></span>
+              <span>PIM eligible (dormant)</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 0.625rem;">
+              <span style="display: inline-block; width: 24px; height: 3px; background: #2563eb;"></span>
+              <span>Group membership</span>
+            </div>
+          </div>
 
-        html = html.replace('<body>', f'<body style="margin:0;padding-top:50px">{overlay}')
+          <div style="font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; font-size: 0.7rem; color: #64748b; margin: 1rem 0 0.75rem;">Severity</div>
+          <div style="display: flex; flex-direction: column; gap: 0.375rem; font-size: 0.8rem;">
+            <div><span style="display: inline-block; width: 8px; height: 8px; background: #ff0000; border-radius: 50%; margin-right: 0.5rem;"></span>Critical &mdash; Tier 0 role, active</div>
+            <div><span style="display: inline-block; width: 8px; height: 8px; background: #ff7a00; border-radius: 50%; margin-right: 0.5rem;"></span>High &mdash; Tier 0 dormant, Tier 1 active</div>
+            <div><span style="display: inline-block; width: 8px; height: 8px; background: #ffd400; border-radius: 50%; margin-right: 0.5rem;"></span>Medium &mdash; Tier 1 dormant, Tier 2 active</div>
+          </div>
 
-        with open(output_file, 'w') as f:
+          <div style="margin-top: 1rem; padding-top: 0.75rem; border-top: 1px solid #e5e7eb; font-size: 0.75rem; color: #64748b; line-height: 1.6;">
+            <div><strong style="color: #0f172a;">Hover</strong> any node for details</div>
+            <div><strong style="color: #0f172a;">Drag</strong> to rearrange</div>
+            <div><strong style="color: #0f172a;">Scroll</strong> to zoom</div>
+            <div style="margin-top: 0.5rem; font-style: italic;">"N users" nodes are collapsed group memberships. Hover to see the roster.</div>
+          </div>
+        </div>
+        """
+        html = html.replace("<body>", f"<body style='margin:0;background:#f8fafc'>{banner}")
+        html = html.replace("</body>", f"{legend}{hover_js}</body>")
+
+        with open(output_file, "w") as f:
             f.write(html)
+
+        print(f"Graph saved to {output_file}")
 
 
 def main():
-    visualizer = EntraPrivilegeVisualizer('output/scan_results.json')
-    visualizer.generate_visualization('output/privilege_graph.html')
+    viz = EntraPrivilegeVisualizer()
+    viz.generate_html_report()
+    viz.generate_graph()
+    print("\nBoth artifacts generated.")
+    print("  Structured report: output/privilege_report.html")
+    print("  Interactive graph: output/privilege_graph.html")
 
 
 if __name__ == "__main__":
