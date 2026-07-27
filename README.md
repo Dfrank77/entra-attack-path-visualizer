@@ -2,6 +2,8 @@
 
 Scans a Microsoft Entra ID tenant via Microsoft Graph, detects privilege escalation paths through direct role assignments, group memberships, and PIM eligible assignments, and produces a structured HTML report.
 
+**Note:** Validated against a lab tenant seeded with intentional misconfigurations, (excess privileged assignments, nested group, escalation paths, dormant PIM eligibility). Findings reflect that seeded environment, not a production tenant.
+
 Part of a three-tool portfolio built on the shared [`entra-security-report`](https://github.com/Dfrank77/entra-security-report) library, alongside [`entra-workload-identity-scanner`](https://github.com/Dfrank77/entra-workload-identity-scanner) and [`entra-zt-policy-engine`](https://github.com/Dfrank77/entra-zt-policy-engine).
 
 ![Sample report](docs/Entra_ID_Privilege_Escalation_Map.jpeg)
