@@ -1,6 +1,6 @@
 # Entra ID Attack Path Visualizer
 
-Scans a Microsoft Entra ID tenant via Microsoft Graph, detects privilege escalation paths through direct role assignments, group memberships, and PIM eligible assignments, and produces two artifacts: a structured HTML report and an interactive graph.
+Scans a Microsoft Entra ID tenant via Microsoft Graph, detects privilege escalation paths through direct role assignments, group memberships, and PIM eligible assignments, and produces a structured HTML report.
 
 Part of a three-tool portfolio built on the shared [`entra-security-report`](https://github.com/Dfrank77/entra-security-report) library, alongside [`entra-workload-identity-scanner`](https://github.com/Dfrank77/entra-workload-identity-scanner) and [`entra-zt-policy-engine`](https://github.com/Dfrank77/entra-zt-policy-engine).
 
