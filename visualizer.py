@@ -34,7 +34,7 @@ class EntraPrivilegeVisualizer:
         html = render(
             self.findings,
             title="Entra ID Privilege Escalation Map",
-            subtitle=f"Tenant {self.scan.tenant_id}",
+            subtitle=f"Tenant ...{self.scan.tenant_id.split('-')[-1]}",
             tenant_id=self.scan.tenant_id,
             group_by="subject",
             metadata={
@@ -226,7 +226,7 @@ class EntraPrivilegeVisualizer:
             <div>
               <div style="font-size: 1.25rem; font-weight: 700;">Entra ID Privilege Escalation Map</div>
               <div style="color: #7d8590; font-size: 0.85rem; margin-top: 0.25rem;">
-                Tenant {self.scan.tenant_id} · {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}
+                Tenant ...{self.scan.tenant_id.split('-')[-1]} · {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}
               </div>
             </div>
             <div style="margin-left: auto; display: flex; gap: 2rem; align-items: baseline;">
