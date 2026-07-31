@@ -121,8 +121,18 @@ class EntraPrivilegeScanner:
             roles = result.value if result.value else []
             for role in roles:
                 role_name = role.display_name
-                members_result = await self.client.directory_roles.by_directory_role_id(role.id).members.get()
-                members = members_result.value if members_result.value else []
+                members = []
+                mpage = await self.client.directory_roles.by_directory_role_id(role.id).members.get()
+                while mpage is not None:
+                    members.extend(mpage.value or [])
+                    mnext = getattr(mpage, "odata_next_link", None)
+                    if not mnext:
+                        break
+                    mpage = await self.client.directory_roles.by_directory_role_id(role.id).members.with_url(mnext).get()
+                if "Privileged Authentication" in (role_name or ""):
+                    print(f"[DEBUG] role '{role_name}' has {len(members)} members:")
+                    for _m in members:
+                        print(f"[DEBUG]    {getattr(_m,'display_name','?')} | {type(_m).__name__} | {_m.id}")
                 for member in members:
                     self.role_assignments.append({
                         "role": role_name,
