@@ -13,7 +13,7 @@ from entra_security_report import Storage, render
 
 class EntraPrivilegeVisualizer:
     def __init__(self):
-        self.storage = Storage(".findings")
+        self.storage = Storage()
         latest_scan = self.storage.latest_scan(tool="attack-path")
         if not latest_scan:
             raise SystemExit("No attack-path scans found. Run entra_scanner.py first.")
