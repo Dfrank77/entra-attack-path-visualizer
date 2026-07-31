@@ -199,8 +199,14 @@ class EntraPrivilegeScanner:
 
             if is_group:
                 try:
-                    members_result = await self.client.groups.by_group_id(member_id).members.get()
-                    members = members_result.value if members_result.value else []
+                    members = []
+                    page = await self.client.groups.by_group_id(member_id).members.get()
+                    while page is not None:
+                        members.extend(page.value or [])
+                        next_link = getattr(page, "odata_next_link", None)
+                        if not next_link:
+                            break
+                        page = await self.client.groups.by_group_id(member_id).members.with_url(next_link).get()
                     for member in members:
                         display_name = getattr(member, "display_name", "Unknown")
                         self.findings.append(self._path_finding(
@@ -303,7 +309,7 @@ class EntraPrivilegeScanner:
 
     def persist(self):
         """Write findings and scan record to shared storage."""
-        storage = Storage(".findings")
+        storage = Storage()
         scan = Scan(tool=TOOL, tenant_id=self.tenant_id)
         storage.record_scan(scan, self.findings)
         return storage
